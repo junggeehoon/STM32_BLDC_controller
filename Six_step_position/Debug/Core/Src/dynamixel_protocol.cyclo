@@ -1,0 +1,7 @@
+../Core/Src/dynamixel_protocol.c:25:6:process_packet	9
+../Core/Src/dynamixel_protocol.c:84:13:handle_ping	1
+../Core/Src/dynamixel_protocol.c:93:13:handle_read	2
+../Core/Src/dynamixel_protocol.c:110:13:handle_write	8
+../Core/Src/dynamixel_protocol.c:159:13:send_status_packet	2
+../Core/Src/dynamixel_protocol.c:185:6:RS485_Transmit	1
+../Core/Src/dynamixel_protocol.c:190:16:update_crc	2

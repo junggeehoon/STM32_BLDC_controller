@@ -1,0 +1,7 @@
+../Core/Src/dynamixel_protocol.c:25:6:process_packet	32	static
+../Core/Src/dynamixel_protocol.c:84:13:handle_ping	24	static
+../Core/Src/dynamixel_protocol.c:93:13:handle_read	24	static
+../Core/Src/dynamixel_protocol.c:110:13:handle_write	32	static
+../Core/Src/dynamixel_protocol.c:159:13:send_status_packet	24	static
+../Core/Src/dynamixel_protocol.c:185:6:RS485_Transmit	16	static
+../Core/Src/dynamixel_protocol.c:190:16:update_crc	536	static
