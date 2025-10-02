@@ -32,6 +32,9 @@ extern "C" {
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#define RS485_TX_ENABLE() HAL_GPIO_WritePin(RS485_TX_EN_GPIO_Port, RS485_TX_EN_Pin, GPIO_PIN_SET)
+#define RS485_RX_ENABLE() HAL_GPIO_WritePin(RS485_TX_EN_GPIO_Port, RS485_TX_EN_Pin, GPIO_PIN_RESET)
+
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -69,12 +72,16 @@ void Error_Handler(void);
 #define INL2_EN2_GPIO_Port GPIOB
 #define INL3_EN3_Pin GPIO_PIN_15
 #define INL3_EN3_GPIO_Port GPIOB
+#define LED_Pin GPIO_PIN_9
+#define LED_GPIO_Port GPIOC
 #define HALL_A_Pin GPIO_PIN_10
 #define HALL_A_GPIO_Port GPIOC
 #define HALL_B_Pin GPIO_PIN_11
 #define HALL_B_GPIO_Port GPIOC
 #define HALL_C_Pin GPIO_PIN_12
 #define HALL_C_GPIO_Port GPIOC
+#define RS485_TX_EN_Pin GPIO_PIN_8
+#define RS485_TX_EN_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

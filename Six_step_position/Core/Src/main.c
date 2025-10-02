@@ -22,6 +22,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "math.h"
+#include "dynamixel_protocol.h"
+#include "control_table.h"
+#include <stdbool.h>
 
 /* USER CODE END Includes */
 
@@ -47,9 +50,10 @@
 
 // Encoder Parameters
 #define ENCODER_PPR 4096  						// Encoder's Pulses Per Revolution
-#define CONTROL_LOOP_DT 0.01f				    // Closed loop time step
+#define CONTROL_LOOP_DT 0.001f				    // Closed loop time step
 #define ENCODER_TIMER_MAX_PERIOD 4294967295.0   // Maximum counter value for a 32-bit timer
 #define CAPTURE_TIMER_CLK_FREQ 1000000.0f
+#define ENCODER_MID_POINT 2147483647
 
 // Current loop parameters
 #define CALIBRATION_SAMPLES 2000
@@ -60,6 +64,13 @@
 
 #define PWM_MAX_PULSE 1200.0f           		// (TIM1 Period - 1) = 1200 - 1
 #define PWM_MIN_PULSE 0.0f
+
+#define CURRENT_DEADPOINT 0.1f
+
+#define GAIN_SCALER 	1000.0f
+#define VELOCITY_SCALER 0.228881836f
+#define POSITION_SCALER 0.087890625f
+#define PWM_SCALER      0.112994350f
 
 /* USER CODE END PD */
 
@@ -74,9 +85,20 @@ ADC_HandleTypeDef hadc1;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
-TIM_HandleTypeDef htim4;
+TIM_HandleTypeDef htim6;
+
+UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+
+typedef enum {
+    STATE_WAIT_HEADER_1,    // Waiting for the first 0xFF
+    STATE_WAIT_HEADER_2,    // Waiting for the second 0xFF
+    STATE_WAIT_HEADER_3,    // Waiting for 0xFD
+    STATE_WAIT_RESERVED,    // Waiting for the reserved byte (0x00)
+    STATE_RECEIVE_DATA      // Receiving the rest of the packet
+} DXL_RX_STATE;
+
 const uint8_t hall_to_sector_map_CW[8] = {
     INVALID_SECTOR,
     SECTOR_6, // Hall 1
@@ -107,14 +129,21 @@ typedef enum {
 
 typedef enum {
 	CW,
-	CCW
+	CCW,
+	STOPPED
 } MotorDirection;
 uint8_t sector = 0;
 uint8_t motor_fault = 0;
 
-// Encoder variables
-volatile float angle_degrees = 0.0f;    // mechanical angle [0–360)
-volatile float speed_rpm = 0.0f;        // filtered speed in RPM
+// DINAMIXEL Protocol variables
+uint8_t  rxByte;                      		// Buffer for single byte reception
+uint8_t  packetBuffer[64];            		// Buffer to build the full packet
+uint16_t packetIndex = 0;             		// Current position in the packetBuffer
+uint16_t packetLength = 0;            		// Expected length of the incoming packet
+DXL_RX_STATE rxState = STATE_WAIT_HEADER_1; // Initial state
+
+uint32_t counter;
+
 volatile float latest_pulse_period_s = 0.0f;
 
 volatile uint32_t ic_capture1 = 0;          // Stores the first capture timestamp
@@ -134,38 +163,16 @@ volatile uint16_t current_a_offset_adc = 0;
 volatile uint16_t current_b_offset_adc = 0;
 volatile uint16_t current_c_offset_adc = 0;
 
-volatile float current_setpoint = 0.0f;
-volatile float current_magnitude = 0.0f;  // Actual current magnitude (A)
-volatile float current_error = 0.0f;
 volatile float current_integral = 0.0f;
-volatile float pi_output = 0.0f;
-
-float CURRENT_KP = 9.8f;
-float CURRENT_KI = 0.144f;
 
 // Velocity control variables
-volatile float target_speed = 0.0f;
-volatile float velocity_error = 0.0f;
 volatile float previous_velocity_error = 0.0f;
 volatile float velocity_integral = 0.0f;
 
-//float VELOCITY_KP = 0.08f;
-//float VELOCITY_KD = 0.0045f;
-//float VELOCITY_KI = 0.06f;
-float VELOCITY_KP = 0.1f;
-float VELOCITY_KD = 0.002f;
-float VELOCITY_KI = 0.2f;
-
-
 // Position control variables
-volatile float target_angle = 0.0f;
 volatile float angle_error = 0.0f;
 volatile float previous_angle_error = 0.0f;
 volatile float angle_integral = 0.0f;
-
-float POSITION_KP = 0.092f;
-float POSITION_KD = 0.003f;
-float POSITION_KI = 0.003f;
 
 void convert_adc_to_current(void);
 void getActivePhaseCurrent(void);
@@ -173,12 +180,16 @@ uint16_t current_pi_controller(void);
 float velocity_pid_controller(void);
 float position_pid_controller(void);
 void calculate_speed_from_capture(void);
+void sixStepCommutation(uint8_t sector, uint16_t pwm_duty);
 void update_angle_from_encoder(void);
 void calibrate_current_sensors(void);
+void reset_pid_controllers(void);
+void torque_enable(void);
+void torque_disable(void);
 
-volatile uint16_t pwm_duty = 0.0f;
+//volatile uint16_t pwm_duty = 0.0f;
 MotorDirection direction = CW;
-uint8_t motor_stop = 0;
+//uint8_t motor_stop = 0;
 
 /* USER CODE END PV */
 
@@ -189,7 +200,8 @@ static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -198,29 +210,35 @@ static void MX_TIM4_Init(void);
 /* USER CODE BEGIN 0 */
 uint16_t current_pi_controller(void)
 {
-    // Error
-    current_error = fabs(current_setpoint) - current_magnitude;
+    // Error in amperes
+    float current_error = (fabs(control_table.goal_current) - fabs(control_table.present_current)) / GAIN_SCALER;
 
     // Integral
     current_integral += current_error * ADC_DT;
 
     // Integral anti-windup
-    if (current_integral > 50) {
-    	current_integral = 50;
-    } else if (current_integral < -50) {
-    	current_integral = -50;
+    if (current_integral > 50.0f) {
+    	current_integral = 50.0f;
+    } else if (current_integral < -50.0f) {
+    	current_integral = -50.0f;
     }
 
-    // Calculate PI output
-    pi_output = current_error * CURRENT_KP + current_integral * CURRENT_KI;
+    // PI output
+    float p_term = current_error * (control_table.current_p_gain / GAIN_SCALER);
+    float i_term = current_integral * (control_table.current_i_gain / GAIN_SCALER);
+    float pi_output = p_term + i_term;
 
     // Convert target voltage to PWM duty cycle
     float pid = (pi_output / V_BUS) * PWM_MAX_PULSE;
 
     // Saturate
-    if (pid > 600) {
-    	pid = 600;
+    if (pid > control_table.pwm_limit) {
+    	pid = control_table.pwm_limit;
     } else if (pid < 0.0f) {
+    	pid = 0.0f;
+    }
+
+    if (pid < 30.0f) {
     	pid = 0.0f;
     }
 
@@ -230,10 +248,10 @@ uint16_t current_pi_controller(void)
 float velocity_pid_controller(void)
 {
 	// Error
-	velocity_error = target_speed - speed_rpm;
+	float velocity_error = VELOCITY_SCALER * (control_table.goal_velocity - control_table.present_velocity);
 
 	// P term
-	float p_term = VELOCITY_KP * velocity_error;
+	float p_term = (control_table.velocity_p_gain / GAIN_SCALER) * velocity_error;
 
 	// Integral
 	velocity_integral += velocity_error * CONTROL_LOOP_DT;
@@ -243,39 +261,42 @@ float velocity_pid_controller(void)
 	if (velocity_integral < -100.0f) velocity_integral = -100.0f;
 
 	// I term
-	float i_term = VELOCITY_KI * velocity_integral;
+	float i_term = (control_table.velocity_i_gain / GAIN_SCALER) * velocity_integral;
 
-	float derivative = (velocity_error - previous_velocity_error) / CONTROL_LOOP_DT;
+	float desired_current = (p_term + i_term) * GAIN_SCALER;
 
-	// D term
-	float d_term = VELOCITY_KD * derivative;
-	previous_velocity_error = velocity_error;
+	// Saturate
+	if (desired_current > control_table.current_limit) {
+		desired_current = control_table.current_limit;
+	} else if (desired_current < -control_table.current_limit) {
+		desired_current = -control_table.current_limit;
+	}
 
-	float pid_output = p_term + i_term + d_term;
-
-	return pid_output;
+	return desired_current;
 }
 
 float position_pid_controller(void) {
 
-    float angle_error = target_angle - angle_degrees;
-//    if (angle_error > 180.0f) {
-//        angle_error -= 360.0f;
-//    } else if (angle_error < -180.0f) {
-//        angle_error += 360.0f;
-//    }
+    float angle_error = control_table.goal_position - control_table.present_position;
 
-    float p_term = POSITION_KP * angle_error;
+    float p_term = (control_table.position_p_gain / GAIN_SCALER) * angle_error;
     angle_integral += angle_error * CONTROL_LOOP_DT;
-    float i_term = POSITION_KI * angle_integral;
+    float i_term = (control_table.position_i_gain / GAIN_SCALER) * angle_integral;
 
     float derivative = (angle_error - previous_angle_error) / CONTROL_LOOP_DT;
 
-    float d_term = POSITION_KD * derivative;
+    float d_term = (control_table.position_d_gain / GAIN_SCALER) * derivative;
     previous_angle_error = angle_error;
-    float pid_output = p_term + i_term + d_term;
+    float desired_speed = p_term + i_term + d_term;
 
-    return pid_output;
+    // Saturate
+    if (desired_speed > control_table.velocity_limit) {
+    	desired_speed = control_table.velocity_limit;
+    } else if (desired_speed < -control_table.velocity_limit) {
+    	desired_speed = -control_table.velocity_limit;
+    }
+
+    return desired_speed;
 }
 
 void convert_adc_to_current(void)
@@ -340,51 +361,42 @@ void calibrate_current_sensors(void)
 
 void calculate_speed_from_capture(void)
 {
+    static float filtered_velocity_raw = 0.0f;
     static uint32_t last_valid_period_tick = 0;
-    float pulse_period_s = latest_pulse_period_s; // Read the shared variable once
 
-    // If the period is changing, a new pulse has arrived. Reset the timeout.
+    float pulse_period_s = latest_pulse_period_s;
+
     if (pulse_period_s > 0.0f) {
         last_valid_period_tick = HAL_GetTick();
-        latest_pulse_period_s = 0.0f; // Consume the value
+        latest_pulse_period_s = 0.0f;
     }
 
-    // If no new pulse for 100ms, assume stopped
     if (HAL_GetTick() - last_valid_period_tick > 100) {
-        speed_rpm = 0.0f;
+        control_table.present_velocity = 0;
+        filtered_velocity_raw = 0.0f;
         is_first_capture = 1;
-        return; // Exit early
+        return;
     }
 
-    // Only calculate speed if we have a valid, new period
     if (pulse_period_s > 0.0f)
     {
         float speed_rps = (1.0f / (ENCODER_PPR * 4.0f)) / pulse_period_s;
-        int8_t direction = __HAL_TIM_IS_TIM_COUNTING_DOWN(&htim2) ? -1 : 1;
-        float new_speed_rpm = speed_rps * 60.0f * (float)direction;
+        float new_speed_rpm = speed_rps * 60.0f;
+        float new_velocity_raw = new_speed_rpm / VELOCITY_SCALER;
 
-        const float alpha = 0.90f;
-        speed_rpm = alpha * speed_rpm + (1.0f - alpha) * new_speed_rpm;
+        const float alpha = 0.8f;
+        filtered_velocity_raw = (alpha * filtered_velocity_raw) + ((1.0f - alpha) * new_velocity_raw);
+
+        int8_t dir = __HAL_TIM_IS_TIM_COUNTING_DOWN(&htim2) ? 1 : -1;
+
+        control_table.present_velocity = (int32_t)(filtered_velocity_raw * dir);
     }
 }
 
 void update_angle_from_encoder(void)
 {
-    static uint32_t last_encoder_count = 0;
-    uint32_t current_encoder_count = __HAL_TIM_GET_COUNTER(&htim2);
-
-    int32_t diff = (int32_t)(current_encoder_count - last_encoder_count);
-
-    // Update angle in degrees
-    angle_degrees += 360.0f * (float)diff / (ENCODER_PPR * 4.0f);
-
-    // Wrap angle
-//    angle_degrees = fmodf(angle_degrees, 360.0f);
-//    if (angle_degrees < 0.0f) {
-//        angle_degrees += 360.0f;
-//    }
-
-    last_encoder_count = current_encoder_count;
+	int32_t current_position = (int32_t)__HAL_TIM_GET_COUNTER(&htim2) / 4;
+	control_table.present_position = current_position;
 }
 
 
@@ -400,25 +412,45 @@ uint8_t read_hall_sensors(void)
 	return hall_state;	// A -> B -> C
 }
 
-void stopMotor(void)
+void reset_pid_controllers(void)
 {
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+	current_integral = 0;
+	velocity_integral = 0;
+	angle_integral = 0;
+
+	previous_velocity_error = 0.0f;
+	velocity_integral = 0.0f;
+}
+
+void torque_enable(void)
+{
+	control_table.torque_enable = 1;
+
+	reset_pid_controllers();
+
+	direction = STOPPED;
+
+    // Enable main driver.
+    HAL_GPIO_WritePin(DRIVE_EN3_GPIO_Port, DRIVE_EN3_Pin, GPIO_PIN_SET);
+
+    // Read initial hall state and set initial commutation
+    uint8_t initial_hall_state = read_hall_sensors();
+    sector = hall_to_sector_map_CW[initial_hall_state & 0x07];
+    sixStepCommutation(sector, 0);
+}
+
+void torque_disable(void)
+{
+	control_table.torque_enable = 0;
+
+	// Disable main driver.
+	HAL_GPIO_WritePin(DRIVE_EN3_GPIO_Port, DRIVE_EN3_Pin, GPIO_PIN_RESET);
 
     HAL_GPIO_WritePin(INL1_EN1_GPIO_Port, INL1_EN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(INL2_EN2_GPIO_Port, INL2_EN2_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(INL3_EN3_GPIO_Port, INL3_EN3_Pin, GPIO_PIN_RESET);
-
-    current_integral = 0;
-    velocity_integral = 0;
-    angle_integral = 0;
-
-    velocity_error = 0.0f;
-    previous_velocity_error = 0.0f;
-    velocity_integral = 0.0f;
-
 }
+
 
 /**
  * @brief Turns the High-Side ON (with PWM) and the Low-Side OFF.
@@ -541,26 +573,34 @@ void sixStepCommutation(uint8_t sector, uint16_t pwm_duty_cycle) {
 
 void getActivePhaseCurrent(void)
 {
+	float current_magnitude = 0.0f;
+
 	switch (sector) {
 			case SECTOR_2:
 			case SECTOR_3:
-				current_magnitude = fabs(current_a);
+				current_magnitude = current_a * GAIN_SCALER;
 				break;
 
 			case SECTOR_4:
 			case SECTOR_5:
-				current_magnitude = fabs(current_b);
+				current_magnitude = current_b * GAIN_SCALER;
 				break;
 
 			case SECTOR_1:
 			case SECTOR_6:
-				current_magnitude = fabs(current_c);
+				current_magnitude = current_c * GAIN_SCALER;
 				break;
 
 			default:
-				current_magnitude = 0.0f;
+				control_table.present_current = 0.0f;
 				break;
 		}
+
+	if (direction == CW) {
+		control_table.present_current = -fabs(current_magnitude);
+	} else if (direction == CCW) {
+		control_table.present_current = fabs(current_magnitude);
+	}
 }
 
 
@@ -599,18 +639,23 @@ int main(void)
   MX_TIM2_Init();
   MX_ADC1_Init();
   MX_TIM3_Init();
-  MX_TIM4_Init();
+  MX_USART1_UART_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
 
+  // Initialize control table variables
+  control_table_init();
+
+  // Start as receive mode
+  RS485_RX_ENABLE();
+
+  // Read one bytes of data in the interrupt mode
+  HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+
+  // Calibrate current adc offset
   calibrate_current_sensors();
 
-  // Enable main driver.
-  HAL_GPIO_WritePin(DRIVE_EN3_GPIO_Port, DRIVE_EN3_Pin, GPIO_PIN_SET);
-
-  // Read initial hall state and set initial commutation
-  uint8_t initial_hall_state = read_hall_sensors();
-  sector = hall_to_sector_map_CW[initial_hall_state & 0x07];
-  sixStepCommutation(sector, 0);
+  torque_enable();
 
   // Start timer1
   HAL_TIM_Base_Start(&htim1);
@@ -633,7 +678,9 @@ int main(void)
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
 
   // Start Timer4 for velocity loop
-  HAL_TIM_Base_Start_IT(&htim4);
+  HAL_TIM_Base_Start_IT(&htim6);
+
+  torque_disable();
 
   /* USER CODE END 2 */
 
@@ -643,8 +690,15 @@ int main(void)
   {
 	  if (HAL_GPIO_ReadPin(FAULT_GPIO_Port, FAULT_Pin) == GPIO_PIN_RESET) {
 		  motor_fault = 1;
-		  stopMotor();
+		  torque_disable();
 	  }
+
+	  if (control_table.led == 1) {
+		  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+	  } else {
+		  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+	  }
+
 
     /* USER CODE END WHILE */
 
@@ -754,7 +808,7 @@ static void MX_ADC1_Init(void)
   sConfigInjected.InjectedNbrOfConversion = 3;
   sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_28CYCLES;
   sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONVEDGE_RISING;
-  sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJECCONV_T1_CC4;
+  sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJECCONV_T1_TRGO;
   sConfigInjected.AutoInjectedConv = DISABLE;
   sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
   sConfigInjected.InjectedOffset = 0;
@@ -826,7 +880,7 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC4REF;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
   {
@@ -851,7 +905,7 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.Pulse = 600;
+  sConfigOC.Pulse = 1199;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
@@ -982,47 +1036,73 @@ static void MX_TIM3_Init(void)
 }
 
 /**
-  * @brief TIM4 Initialization Function
+  * @brief TIM6 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_TIM4_Init(void)
+static void MX_TIM6_Init(void)
 {
 
-  /* USER CODE BEGIN TIM4_Init 0 */
+  /* USER CODE BEGIN TIM6_Init 0 */
 
-  /* USER CODE END TIM4_Init 0 */
+  /* USER CODE END TIM6_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM4_Init 1 */
+  /* USER CODE BEGIN TIM6_Init 1 */
 
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 7200-1;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 100-1;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 720-1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 100-1;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM4_Init 2 */
+  /* USER CODE BEGIN TIM6_Init 2 */
 
-  /* USER CODE END TIM4_Init 2 */
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
 
 }
 
@@ -1044,17 +1124,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DRIVE_EN3_GPIO_Port, DRIVE_EN3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, DRIVE_EN3_Pin|LED_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, INL1_EN1_Pin|INL2_EN2_Pin|INL3_EN3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, INL1_EN1_Pin|INL2_EN2_Pin|INL3_EN3_Pin|RS485_TX_EN_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : DRIVE_EN3_Pin */
-  GPIO_InitStruct.Pin = DRIVE_EN3_Pin;
+  /*Configure GPIO pins : DRIVE_EN3_Pin LED_Pin */
+  GPIO_InitStruct.Pin = DRIVE_EN3_Pin|LED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(DRIVE_EN3_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : FAULT_Pin */
   GPIO_InitStruct.Pin = FAULT_Pin;
@@ -1062,8 +1142,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(FAULT_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : INL1_EN1_Pin INL2_EN2_Pin INL3_EN3_Pin */
-  GPIO_InitStruct.Pin = INL1_EN1_Pin|INL2_EN2_Pin|INL3_EN3_Pin;
+  /*Configure GPIO pins : INL1_EN1_Pin INL2_EN2_Pin INL3_EN3_Pin RS485_TX_EN_Pin */
+  GPIO_InitStruct.Pin = INL1_EN1_Pin|INL2_EN2_Pin|INL3_EN3_Pin|RS485_TX_EN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -1081,56 +1161,175 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+// After TX complete, switch back to RX mode
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        RS485_RX_ENABLE();
+        HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+    }
+}
 
-float test_current = 0.0f;
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+
+    	switch (rxState)
+    	{
+    		case STATE_WAIT_HEADER_1:
+    			if (rxByte == 0xFF) {
+    				packetBuffer[packetIndex++] = rxByte;
+    				rxState = STATE_WAIT_HEADER_2;
+    			}
+    			break;
+    		case STATE_WAIT_HEADER_2:
+    			if (rxByte == 0xFF) {
+					packetBuffer[packetIndex++] = rxByte;
+					rxState = STATE_WAIT_HEADER_3;
+				} else {
+					rxState = STATE_WAIT_HEADER_1;
+                    packetIndex = 0;
+				}
+    			break;
+    		case STATE_WAIT_HEADER_3:
+    			if (rxByte == 0xFD) {
+					packetBuffer[packetIndex++] = rxByte;
+					rxState = STATE_WAIT_RESERVED;
+				} else {
+					rxState = STATE_WAIT_HEADER_1;
+                    packetIndex = 0;
+				}
+    			break;
+    		case STATE_WAIT_RESERVED:
+    			if (rxByte == 0x00) {
+					packetBuffer[packetIndex++] = rxByte;
+					rxState = STATE_RECEIVE_DATA;
+				} else {
+					rxState = STATE_WAIT_HEADER_1;
+                    packetIndex = 0;
+				}
+    			break;
+    		case STATE_RECEIVE_DATA:
+                packetBuffer[packetIndex++] = rxByte;
+
+                // Combines length into a single 16-bit number
+                if (packetIndex == 7) {
+                    packetLength = (uint16_t)(packetBuffer[6] << 8 | packetBuffer[5]);
+                }
+
+                // Total size = Header(4) + ID(1) + Len(2) + Length Value = 7 + packetLength
+                if (packetIndex >= 7 && (packetIndex == (7 + packetLength))) {
+                	bool tx_started = process_packet(packetBuffer, packetLength);
+                	packetIndex = 0;
+                	rxState = STATE_WAIT_HEADER_1;
+                	// Stop listening while transmitting
+                	if (tx_started) {
+                		return;
+                	}
+                }
+                break;
+    		default:
+    			rxState = STATE_WAIT_HEADER_1;
+    			packetIndex = 0;
+    			packetLength = 0;
+    			break;
+
+    	}
+    	HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+    }
+}
 
 // ADC call back
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	if (motor_fault || motor_stop) {
-		stopMotor();
-		return;
-	}
-
-	uint8_t hall_state = read_hall_sensors();
-
-	if (direction == CW)
-	    sector = hall_to_sector_map_CW[hall_state & 0x07];
-	else
-	    sector = hall_to_sector_map_CCW[hall_state & 0x07];
 
 	adc_cur_c = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1); // CH3 (PA3)
 	adc_cur_b = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_2); // CH14 (PC4)
 	adc_cur_a = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_3); // CH15 (PC5)
 	convert_adc_to_current();
-
 	getActivePhaseCurrent();
 
-	pwm_duty = current_pi_controller();
+	if (motor_fault || !control_table.torque_enable) {
+		return;
+	}
 
-	sixStepCommutation(sector, pwm_duty);
+	uint16_t pwm_duty = 0;
+	if (control_table.operating_mode == PWM_CONTROL) {
+		if (control_table.goal_pwm >= 0) {
+			direction = CCW;
+		} else {
+			direction = CW;
+		}
+		pwm_duty = (uint16_t) fabs(control_table.goal_pwm);
+	} else {
+		pwm_duty = current_pi_controller();
+	}
+
+	control_table.present_pwm = pwm_duty;
+
+	uint8_t hall_state = read_hall_sensors();
+
+	if (direction == CW) {
+	    sector = hall_to_sector_map_CW[hall_state & 0x07];
+		sixStepCommutation(sector, pwm_duty);
+	} else if (direction == CCW) {
+	    sector = hall_to_sector_map_CCW[hall_state & 0x07];
+	    sixStepCommutation(sector, pwm_duty);
+	} else {
+	    SetPhase_FLOAT(PHASE_A);
+	    SetPhase_FLOAT(PHASE_B);
+	    SetPhase_FLOAT(PHASE_C);
+	}
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  if (htim->Instance == TIM4)
+  if (htim->Instance == TIM6)
   {
+	counter++;
+	control_table.realtime_tick = counter % 32768;
+
     calculate_speed_from_capture();
     update_angle_from_encoder();
 
-//    target_speed = position_pid_controller();
-
-    float new_current_setpoint = velocity_pid_controller();
-
-    if (new_current_setpoint > 0) {
-        direction = CW;
-    } else if (new_current_setpoint < 0) {
-        direction = CCW;
+    if (!control_table.torque_enable) {
+        control_table.goal_current = 0;
+        control_table.goal_velocity = 0;
+        return;
     }
 
-    __disable_irq();
-    current_setpoint = new_current_setpoint;
-    __enable_irq();
+    float current_target = 0.0f;
+
+        switch(control_table.operating_mode)
+        {
+            case POSITION_CONTROL:
+            case EXTENDED_POSITION_CONTROL:
+                // Position loop calculates a target velocity
+                control_table.goal_velocity = position_pid_controller();
+                // Execute velocity loop
+
+            case VELOCITY_CONTROL:
+                current_target = velocity_pid_controller();
+                break;
+
+            case CURRENT_CONTROL:
+                current_target = control_table.goal_current;
+                break;
+
+            case PWM_CONTROL:
+            default:
+                return;
+        }
+
+        if (current_target > CURRENT_DEADPOINT) {
+            direction = CCW;
+        } else if (current_target < -CURRENT_DEADPOINT) {
+            direction = CW;
+        } else {
+        	direction = STOPPED;
+        	reset_pid_controllers();
+        }
+
+        control_table.goal_current = current_target;
   }
 }
 
